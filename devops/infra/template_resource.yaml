@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  This template provisions a serverless architecture for securely exposing a Lambda function
+  through an API Gateway endpoint using the GET method. 
+  It is designed for lightweight use cases such as receiving data submissions, processing incoming requests,
+  or integrating with client-side applications.
+
+Parameters:
+  # Environment in which this stack will be deployed
+  Environment:
+    Type: String
+    Description: The target deployment environment (e.g., dev, staging, prod) to differentiate resources.
+
+  # Resource name prefix for consistent naming convention across resources
+  ResourcePrefix:
+    Type: String
+    Description: Prefix used to name resources (e.g., company, project, or team name) for easy identification.
+
+  # Resource type for better resource tracking and tagging
+  ResourceType:
+    Type: String
+    Description: Logical resource type for tagging and naming (e.g., api, lambda, backend).
+
+  SecretName:
+    Type: String
+    Description: Name of the Secrets Manager secret containing database credentials.
+
+Resources:
+  ######## Cognito User Pool Creation ######## 
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${ResourcePrefix}-${Environment}-${ResourceType}-userPool
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: "OFF"
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+      # Updated schema for email-based authentication
+      Schema:
+        - AttributeDataType: String
+          Name: email
+          Required: true
+          Mutable: true
+        - AttributeDataType: "String"
+          Name: tenantId 
+        - AttributeDataType: "String"
+          Name: userId        
+
+      # Email configuration for verification emails
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+
+      # Password policy (optional but recommended)
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+
+  ########  Cognito User Pool Client Creation ######## 
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${ResourcePrefix}-${Environment}-${ResourceType}-Client
+      GenerateSecret: false 
+      UserPoolId: !Ref CognitoUserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - https://localhost:3000 # Use your app's actual URL
+      LogoutURLs:
+        - https://localhost:3000 # Use your app's actual URL
+      AllowedOAuthScopes:
+        - openid
+        - profile
+        - email
+
+  ########  Cognito Domain Creation ######## 
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Join
+        - '-'
+        - - !Ref Environment
+          - !Ref ResourcePrefix
+          - pooledtenant
+          - !Ref AWS::AccountId
+      UserPoolId: !Ref CognitoUserPool
+
+  ########  S3 Bucket Creation ########
+  ProfileBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ResourcePrefix}-${Environment}-${ResourceType}-profile-bucket"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: !Ref ResourcePrefix
+        - Key: ResourceType
+          Value: !Ref ResourceType
+        - Key: Environment
+          Value: !Ref Environment
+
+  ProfileBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProfileBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+            Resource: !Sub "${ProfileBucket.Arn}/*"
+
+  AppLayers:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${ResourcePrefix}-${Environment}-${ResourceType}-lambda-layer"
+      Description: Utilities for various helper functions
+      ContentUri: ../layer/
+      CompatibleRuntimes:
+        - python3.12
+        - python3.11
+        - python3.10   
+      LicenseInfo: 'MIT'
+      RetentionPolicy: Delete      
+    Metadata:
+      BuildMethod: python3.12
+
+  # IAM Role for Lambda Execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-${Environment}-${ResourceType}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminConfirmSignUp
+                  - cognito-idp:AdminDeleteUser
+                  - cognito-idp:ListUsers
+                  - cognito-idp:SignUp
+                Resource: !GetAtt CognitoUserPool.Arn
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ResourcePrefix
+        - Key: ResourceType
+          Value: !Ref ResourceType
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway for exposing Lambda via endpoints
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${ResourcePrefix}-${Environment}-${ResourceType}-api"
+      StageName: !Sub ${Environment}
+      EndpointConfiguration:
+        Type: REGIONAL
+      DefinitionBody:
+        swagger: "2.0"
+        info:
+          title: !Sub "${ResourcePrefix}-${Environment}-${ResourceType}-api"
+          version: "1.0"
+        paths:
+          /sign_up:
+            post:
+              x-amazon-apigateway-integration:
+                uri: !Sub
+                  - arn:aws:apigateway:${Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+                  - {
+                      Region: !Ref "AWS::Region",
+                      LambdaArn: !GetAtt UserSignUpFunction.Arn
+                    }
+                httpMethod: POST
+                type: aws_proxy
+              responses: {}
+              security:
+                - CognitoAuthorizer: []
+      Cors:
+        AllowMethods: "'GET,OPTIONS,POST,PUT,DELETE'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      Tags:
+        project: !Ref ResourcePrefix
+        ResourceType: !Ref ResourceType
+        Environment: !Ref Environment
+  
+  # User Sign Up Function exposed via POST endpoint
+  UserSignUpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-${Environment}-${ResourceType}-UserSignUp"
+      Handler: services/user_service/handlers/signup_handler.lambda_handler
+      Runtime: python3.12
+      CodeUri: ../../src
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+          COGNITO_APP_CLIENT_ID: !Ref CognitoUserPoolClient
+          REGION: !Ref "AWS::Region"
+          DB_SECRET_NAME: !Ref SecretName
+      Tags:
+        Project: !Ref ResourcePrefix
+        ResourceType: !Ref ResourceType
+        Environment: !Ref Environment
+      Layers:
+        - !Ref AppLayers
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /sign_up
+            Method: post
+            RestApiId: !Ref ApiGateway
+  
+  ProfileUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-${Environment}-${ResourceType}-UploadProfile"
+      Handler: services/profile_service/handlers/upload_profile.lambda_handler
+      Runtime: python3.12
+      CodeUri: ../../src
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          PROFILE_BUCKET_NAME: !Ref ProfileBucket
+          DB_SECRET_NAME: !Ref SecretName
+          REGION: !Ref "AWS::Region"
+      Tags:
+        Project: !Ref ResourcePrefix
+        ResourceType: !Ref ResourceType
+        Environment: !Ref Environment
+      Layers:
+        - !Ref AppLayers
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /upload_profile
+            Method: get
+            RestApiId: !Ref ApiGateway
+
+
+Outputs:
+  ApiUrl:
+    Description: "API Gateway endpoint URL for the deployed API"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/"
+  
+  ProfileBucketName:
+    Description: "S3 bucket used for storing profile pictures"
+    Value: !Ref ProfileBucket

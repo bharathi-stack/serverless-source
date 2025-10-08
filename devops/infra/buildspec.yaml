@@ -1,0 +1,46 @@
+          version: 0.2
+
+          phases:
+            install:
+              runtime-versions:
+                python: 3.12
+              commands:
+                - echo "Installing AWS SAM CLI..."
+                - pip install aws-sam-cli
+                - sam --version
+
+            pre_build:
+              commands:
+                - echo "Deploy started on $(date)"
+
+            build:
+              commands:
+                - echo "Building Lambda Layer..."
+                - mkdir -p layer/python
+                - pip install -r devops/layer/requirements.txt -t layer/python
+
+                - echo "Running SAM deploy..."
+                - |
+                  sam deploy \
+                    -t packaged.yaml \
+                    --stack-name "${RESOURCE_PREFIX}-${ENVIRONMENT}-${RESOURCE_TYPE}-stack" \
+                    --region "${REGION}" \
+                    --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+                    --tags Environment="${ENVIRONMENT}" Project="${RESOURCE_PREFIX}" ResourceType="${RESOURCE_TYPE}" \
+                    --no-fail-on-empty-changeset \
+                    --parameter-overrides \
+                        Environment="${ENVIRONMENT}" \
+                        ResourcePrefix="${RESOURCE_PREFIX}" \
+                        ResourceType="${RESOURCE_TYPE}" \
+                        Region="${REGION}" \
+                        SecretName="${SECRET_NAME}" \
+                - pwd
+                - ls -al
+
+            post_build:
+              commands:
+                - echo "Deploy completed on $(date)"
+
+          artifacts:
+            files:
+              - '**/*'
